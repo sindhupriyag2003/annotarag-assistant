@@ -22,6 +22,8 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 150
 TOP_K = 4
+MODALITIES = ["Audio", "Text", "Image", "Video", "LiDAR", "General / Cross-modality"]
+MODALITY_FILTERS = ["All modalities", *MODALITIES]
 
 # -------------------- WEBSITE STYLING --------------------
 st.markdown("""
@@ -142,7 +144,7 @@ def split_text(text):
         start = end - CHUNK_OVERLAP
     return chunks
 
-def index_webpage(url, text, model, collection):
+def index_webpage(url, text, model, collection, modality):
     chunks = split_text(text)
     if not chunks:
         raise ValueError("No usable text chunks were created.")
@@ -150,27 +152,36 @@ def index_webpage(url, text, model, collection):
     source_key = hashlib.sha256(url.encode()).hexdigest()[:20]
     ids = [hashlib.sha256(f"{source_key}:{i}:{chunk}".encode()).hexdigest()
            for i, chunk in enumerate(chunks)]
-    metadata = [{"source": url, "chunk": i} for i in range(len(chunks))]
+    metadata = [{"source": url, "chunk": i, "modality": modality} for i in range(len(chunks))]
     old = collection.get(where={"source": url})
     if old["ids"]:
         collection.delete(ids=old["ids"])
     collection.add(ids=ids, documents=chunks, embeddings=embeddings, metadatas=metadata)
     return len(chunks)
 
-def retrieve_context(question, model, collection):
+def retrieve_context(question, model, collection, modality_filter="All modalities"):
     total = collection.count()
     if total == 0:
         return []
     query_embedding = model.encode([question], normalize_embeddings=True).tolist()
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=min(TOP_K, total),
-        include=["documents", "metadatas", "distances"],
-    )
+    query_args = {
+        "query_embeddings": query_embedding,
+        "include": ["documents", "metadatas", "distances"],
+    }
+    if modality_filter != "All modalities":
+        query_args["where"] = {"modality": modality_filter}
+        matching_count = collection.count(where={"modality": modality_filter})
+        if matching_count == 0:
+            return []
+        query_args["n_results"] = min(TOP_K, matching_count)
+    else:
+        query_args["n_results"] = min(TOP_K, total)
+    results = collection.query(**query_args)
     found = []
     for i, chunk in enumerate(results["documents"][0]):
         meta = results["metadatas"][0][i]
         found.append({"text": chunk, "url": meta["source"], "chunk": meta["chunk"],
+                      "modality": meta.get("modality", "General / Cross-modality"),
                       "distance": results["distances"][0][i]})
     return found
 
@@ -210,7 +221,12 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.markdown("### Knowledge sources")
-    st.caption("Add public annotation guideline pages to your searchable knowledge base.")
+    st.caption("Add public annotation guideline pages and assign them to an annotation category.")
+    source_modality = st.selectbox(
+        "Category for these webpages",
+        MODALITIES,
+        help="All URLs submitted together will be tagged with this category. Index different categories in separate batches.",
+    )
     urls_text = st.text_area(
         "Webpage URLs",
         placeholder="https://example.com/annotation-guidelines\nhttps://example.org/audio-rules",
@@ -231,8 +247,8 @@ with st.sidebar:
                     with st.status(f"Indexing {url}", expanded=True) as status:
                         try:
                             final_url, body = fetch_webpage(url)
-                            count = index_webpage(final_url, body, model, collection)
-                            st.write(f"Extracted {len(body):,} characters · {count} chunks")
+                            count = index_webpage(final_url, body, model, collection, source_modality)
+                            st.write(f"Category: {source_modality} · Extracted {len(body):,} characters · {count} chunks")
                             status.update(label="Page indexed successfully", state="complete")
                         except Exception as exc:
                             status.update(label="Could not index this page", state="error")
@@ -252,7 +268,7 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
-    st.caption("Supports public HTML pages. Some sites may block automated access.")
+    st.caption("Supports public HTML pages. Index each category in a separate batch. Some sites may block automated access.")
     st.markdown("[Get a Groq API key ↗](https://console.groq.com/keys)")
 
 # -------------------- MAIN PAGE --------------------
@@ -260,7 +276,7 @@ st.markdown("""
 <div class="hero">
   <div class="hero-eyebrow">AI DATA OPERATIONS · KNOWLEDGE HUB</div>
   <h1>Annotation knowledge,<br>at your fingertips.</h1>
-  <p>Search your guideline sources, retrieve relevant evidence, and get clear answers for text, audio, image, and LiDAR annotation workflows.</p>
+  <p>Search trusted guidelines with modality-filtered retrieval for audio, text, image, video, and LiDAR annotation workflows.</p>
   <div class="hero-pill">✦ &nbsp; Retrieval-augmented generation &nbsp; · &nbsp; Source-grounded answers</div>
 </div>
 """, unsafe_allow_html=True)
@@ -292,6 +308,12 @@ with left:
     st.markdown('<div class="section-sub">Ask a practical question and inspect the source passages behind the answer.</div>', unsafe_allow_html=True)
     with st.container(border=True):
         st.markdown('<div class="step-chip">STEP 01 · ASK</div>', unsafe_allow_html=True)
+        modality_filter = st.selectbox(
+            "Search within",
+            MODALITY_FILTERS,
+            index=0,
+            help="Choose a modality to search only matching guideline chunks, or search all categories.",
+        )
         question = st.text_area(
             "What do you need to know?",
             placeholder="e.g. How should unclear speech be handled during transcription?",
@@ -323,9 +345,12 @@ with left:
                 try:
                     model = load_embedding_model()
                     collection = load_collection()
-                    sources = retrieve_context(question, model, collection)
+                    sources = retrieve_context(question, model, collection, modality_filter)
                     if not sources:
-                        st.warning("No relevant passages found.")
+                        if modality_filter == "All modalities":
+                            st.warning("No relevant passages found. Add guideline sources in the sidebar first.")
+                        else:
+                            st.warning(f"No indexed passages found for {modality_filter}. In the sidebar, choose that category and index its guideline webpages, then try again.")
                     else:
                         try:
                             answer = generate_answer(question, sources, api_key)
@@ -342,10 +367,10 @@ with left:
                         st.markdown('<div class="section-heading">Retrieved evidence</div>', unsafe_allow_html=True)
                         st.markdown('<div class="section-sub">Open a source to verify the exact text used as context.</div>', unsafe_allow_html=True)
                         for i, item in enumerate(sources, 1):
-                            with st.expander(f"Source {i}  ·  {item['url']}"):
+                            with st.expander(f"Source {i}  ·  {item['modality']}  ·  {item['url']}"):
                                 st.markdown(f"[Open original webpage ↗]({item['url']})")
                                 st.write(item["text"])
-                                st.caption(f"Chunk {item['chunk']} · cosine distance {item['distance']:.3f}")
+                                st.caption(f"Category: {item['modality']} · Chunk {item['chunk']} · cosine distance {item['distance']:.3f}")
                 except Exception as exc:
                     st.error(f"Could not run retrieval: {exc}")
 
@@ -353,9 +378,9 @@ with right:
     st.markdown('<div class="section-heading">How it works</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-sub">A simple RAG workflow built for annotation teams.</div>', unsafe_allow_html=True)
     for num, title, desc in [
-        ("01", "Connect sources", "Add public guideline pages, SOPs, or annotation manuals."),
+        ("01", "Connect sources", "Add public guideline pages, SOPs, or annotation manuals and assign a modality."),
         ("02", "Prepare knowledge", "Extract text, split it into overlapping chunks, and create embeddings."),
-        ("03", "Retrieve evidence", "Semantic search finds passages relevant to your question."),
+        ("03", "Filter and retrieve", "Semantic search finds relevant passages only within the selected modality, or across all categories."),
         ("04", "Answer with context", "The assistant uses retrieved text and links back to source pages."),
     ]:
         st.markdown(f"""
@@ -374,6 +399,7 @@ with right:
         <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">Text</span>
         <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">Audio</span>
         <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">Image</span>
+        <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">Video</span>
         <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">LiDAR</span>
         <span style="background:#f2f3f8;padding:6px 9px;border-radius:8px;font-size:11px;color:#505b70;">Quality review</span>
       </div>
